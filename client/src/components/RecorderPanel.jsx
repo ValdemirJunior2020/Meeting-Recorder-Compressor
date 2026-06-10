@@ -15,12 +15,75 @@ function normalizeMessage(error) {
   return error.message || String(error);
 }
 
+async function getMicrophoneStream() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+    video: false,
+  });
+}
+
+async function getMeetingAudioStream() {
+  if (!navigator.mediaDevices.getDisplayMedia) {
+    throw new Error("This browser does not support meeting/tab audio capture.");
+  }
+
+  const displayStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      channelCount: 2,
+    },
+  });
+
+  const audioTracks = displayStream.getAudioTracks();
+
+  if (!audioTracks.length) {
+    displayStream.getTracks().forEach((track) => track.stop());
+    throw new Error(
+      "No meeting audio was captured. Pick Chrome Tab and check 'Share tab audio'."
+    );
+  }
+
+  return displayStream;
+}
+
+function mixAudioStreams(streams) {
+  const audioContext = new AudioContext();
+  const destination = audioContext.createMediaStreamDestination();
+
+  streams.forEach((stream) => {
+    const audioTracks = stream.getAudioTracks();
+
+    if (audioTracks.length > 0) {
+      const source = audioContext.createMediaStreamSource(
+        new MediaStream(audioTracks)
+      );
+      source.connect(destination);
+    }
+  });
+
+  return {
+    mixedStream: destination.stream,
+    audioContext,
+  };
+}
+
 function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
   const [meetingName, setMeetingName] = useState("");
   const [meetingType, setMeetingType] = useState("Zoom");
   const [notes, setNotes] = useState("");
   const [compressionMode, setCompressionMode] = useState("smallest");
-  const [audioSource, setAudioSource] = useState("microphone");
+
+  // IMPORTANT: default records both sides
+  const [audioSource, setAudioSource] = useState("mic-and-meeting");
+
   const [isRecording, setIsRecording] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -28,8 +91,9 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
   const [panelError, setPanelError] = useState("");
 
   const chunksRef = useRef([]);
-  const streamRef = useRef(null);
-  const captureStreamRef = useRef(null);
+  const sourceStreamsRef = useRef([]);
+  const mixedStreamRef = useRef(null);
+  const audioContextRef = useRef(null);
   const recorderRef = useRef(null);
   const startedAtRef = useRef(null);
   const intervalRef = useRef(null);
@@ -46,14 +110,20 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
   }, [isSaving]);
 
   const stopAllTracks = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+    sourceStreamsRef.current.forEach((stream) => {
+      stream.getTracks().forEach((track) => track.stop());
+    });
+
+    sourceStreamsRef.current = [];
+
+    if (mixedStreamRef.current) {
+      mixedStreamRef.current.getTracks().forEach((track) => track.stop());
+      mixedStreamRef.current = null;
     }
 
-    if (captureStreamRef.current) {
-      captureStreamRef.current.getTracks().forEach((track) => track.stop());
-      captureStreamRef.current = null;
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
     }
   }, []);
 
@@ -95,6 +165,42 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
     [apiBase, compressionMode, meetingName, meetingType, notes, onSaved]
   );
 
+  const buildRecordingStream = useCallback(async () => {
+    const streams = [];
+
+    if (audioSource === "microphone") {
+      const micStream = await getMicrophoneStream();
+      streams.push(micStream);
+    }
+
+    if (audioSource === "meeting-audio") {
+      const meetingStream = await getMeetingAudioStream();
+      streams.push(meetingStream);
+    }
+
+    if (audioSource === "mic-and-meeting") {
+      const micStream = await getMicrophoneStream();
+      const meetingStream = await getMeetingAudioStream();
+
+      streams.push(micStream);
+      streams.push(meetingStream);
+    }
+
+    sourceStreamsRef.current = streams;
+
+    const { mixedStream, audioContext } = mixAudioStreams(streams);
+
+    mixedStreamRef.current = mixedStream;
+    audioContextRef.current = audioContext;
+
+    if (!mixedStream.getAudioTracks().length) {
+      stopAllTracks();
+      throw new Error("No audio tracks were available to record.");
+    }
+
+    return mixedStream;
+  }, [audioSource, stopAllTracks]);
+
   const startRecording = useCallback(async () => {
     if (isRecordingRef.current || isSavingRef.current) {
       return;
@@ -112,40 +218,8 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
         throw new Error("This browser does not support local audio recording.");
       }
 
-      let recordingStream;
+      const recordingStream = await buildRecordingStream();
 
-      if (audioSource === "screen") {
-        if (!navigator.mediaDevices.getDisplayMedia) {
-          throw new Error("This browser does not support tab/system audio capture.");
-        }
-
-        const captureStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: true,
-        });
-        captureStreamRef.current = captureStream;
-
-        const audioTracks = captureStream.getAudioTracks();
-        if (!audioTracks.length) {
-          stopAllTracks();
-          throw new Error(
-            "No audio track was shared. Choose a tab/window and enable Share audio when the browser asks."
-          );
-        }
-
-        recordingStream = new MediaStream(audioTracks);
-      } else {
-        recordingStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            channelCount: 1,
-          },
-          video: false,
-        });
-      }
-
-      streamRef.current = recordingStream;
       chunksRef.current = [];
 
       const options = MediaRecorder.isTypeSupported(MIME_TYPE)
@@ -169,6 +243,7 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
         const blob = new Blob(chunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
+
         chunksRef.current = [];
         stopAllTracks();
 
@@ -182,11 +257,24 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
       };
 
       recorder.start(1000);
+
       startedAtRef.current = Date.now();
       latestDurationRef.current = 0;
+
       setElapsedSeconds(0);
       setIsRecording(true);
-      setPanelMessage("Recording...");
+
+      if (audioSource === "mic-and-meeting") {
+        setPanelMessage(
+          "Recording microphone + meeting audio. Make sure you selected the meeting tab/window and enabled audio sharing."
+        );
+      } else if (audioSource === "meeting-audio") {
+        setPanelMessage(
+          "Recording meeting audio. Make sure you selected the meeting tab/window and enabled audio sharing."
+        );
+      } else {
+        setPanelMessage("Recording microphone audio.");
+      }
 
       intervalRef.current = window.setInterval(() => {
         const nextElapsed = Math.floor((Date.now() - startedAtRef.current) / 1000);
@@ -199,7 +287,14 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
       setPanelMessage("");
       setPanelError(normalizeMessage(error));
     }
-  }, [audioSource, onServerRetry, serverOnline, stopAllTracks, uploadRecording]);
+  }, [
+    audioSource,
+    buildRecordingStream,
+    onServerRetry,
+    serverOnline,
+    stopAllTracks,
+    uploadRecording,
+  ]);
 
   const stopRecording = useCallback(() => {
     if (!isRecordingRef.current || isSavingRef.current) {
@@ -221,6 +316,7 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
     setPanelMessage("Saving and compressing...");
 
     const recorder = recorderRef.current;
+
     if (recorder && recorder.state !== "inactive") {
       recorder.stop();
     } else {
@@ -233,6 +329,7 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
   useEffect(() => {
     const handleShortcut = (event) => {
       const key = event.key?.toLowerCase();
+
       if (event.ctrlKey && event.shiftKey && key === "r") {
         event.preventDefault();
         event.stopPropagation();
@@ -246,7 +343,10 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
     };
 
     window.addEventListener("keydown", handleShortcut, true);
-    return () => window.removeEventListener("keydown", handleShortcut, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleShortcut, true);
+    };
   }, [startRecording, stopRecording]);
 
   useEffect(() => {
@@ -254,6 +354,7 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
       if (intervalRef.current) {
         window.clearInterval(intervalRef.current);
       }
+
       stopAllTracks();
     };
   }, [stopAllTracks]);
@@ -267,6 +368,7 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
           <span className="eyebrow">Recorder</span>
           <h2>Capture meeting audio</h2>
         </div>
+
         <div className={`recording-badge ${isRecording ? "active" : ""}`}>
           <span className="recording-dot" />
           {isRecording ? "Recording" : "Idle"}
@@ -314,8 +416,9 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
             onChange={(event) => setAudioSource(event.target.value)}
             disabled={controlsLocked}
           >
-            <option value="microphone">Microphone</option>
-            <option value="screen">Tab / system audio when supported</option>
+            <option value="mic-and-meeting">Microphone + Meeting audio</option>
+            <option value="meeting-audio">Meeting audio only</option>
+            <option value="microphone">Microphone only</option>
           </select>
         </label>
 
@@ -362,6 +465,12 @@ function RecorderPanel({ apiBase, onSaved, serverOnline, onServerRetry }) {
           Stop Recording
         </button>
       </div>
+
+      <p className="hint-text">
+        For Zoom, Teams, or Google Meet in Chrome, choose{" "}
+        <strong>Microphone + Meeting audio</strong>, then select the meeting tab/window
+        and enable <strong>Share audio</strong>.
+      </p>
 
       <p className="hint-text">
         Shortcut: <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> toggles start/stop while this page is focused.
